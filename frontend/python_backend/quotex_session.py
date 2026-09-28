@@ -1793,9 +1793,14 @@ class QuotexSession:
         """Send a raw ``history/load`` request and return the broker's candles as-is."""
         client = self.client
         api = getattr(client, "api", None) if client is not None else None
+        if api is None:
+            log.warning("history/load skipped for %s/%s: not connected", asset, period)
+            return []
         store = getattr(api, "history_load_data", None)
         if not isinstance(store, dict):
-            return []
+            # Older pyquotex/api.py without the index store — create it here.
+            store = {}
+            api.history_load_data = store
 
         index = int(time.time() * 100)
         last = getattr(self, "_history_load_last_index", 0)
@@ -1811,7 +1816,9 @@ class QuotexSession:
             "period": int(period),
         }
         try:
-            api.send_websocket_request(f'42["history/load",{json.dumps(payload)}]')
+            await _maybe_await(
+                api.send_websocket_request(f'42["history/load",{json.dumps(payload)}]')
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning("history/load send failed for %s/%s: %s", asset, period, exc)
             return []
@@ -1820,13 +1827,23 @@ class QuotexSession:
         msg = None
         while time.time() < deadline:
             msg = store.pop(index, None)
+            if msg is None:
+                # Older ws/client.py only fills the single historical_candles slot.
+                hc = getattr(api, "historical_candles", None)
+                if isinstance(hc, dict) and hc.get("index") == index:
+                    msg = hc
             if msg is not None:
                 break
             await asyncio.sleep(0.1)
         if not isinstance(msg, dict):
-            log.info("history/load timed out for %s/%s (index=%d)", asset, period, index)
+            log.warning("history/load timed out for %s/%s (index=%d)", asset, period, index)
             return []
-        return _parse_history_load(msg, int(period))
+        candles = _parse_history_load(msg, int(period))
+        if not candles:
+            log.warning(
+                "history/load empty for %s/%s (keys=%s)", asset, period, list(msg.keys())[:8]
+            )
+        return candles
 
     async def get_history(
         self, asset: str, period: int, count: int = 120

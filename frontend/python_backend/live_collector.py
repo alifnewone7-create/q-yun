@@ -262,7 +262,7 @@ class LiveCollector:
                     code, p, end, HISTORY_COUNT * p + p, timeout=HISTORY_TIMEOUT_S
                 )
             except Exception as exc:  # noqa: BLE001
-                log.debug("backfill %s/%s failed: %s", code, p, exc)
+                log.warning("backfill %s/%s failed: %r", code, p, exc)
                 hist = []
         live = self.store.get(key)
         cut = int(self.started_at or time.time())

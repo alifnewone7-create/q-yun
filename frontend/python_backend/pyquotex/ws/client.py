@@ -71,7 +71,7 @@ class WebsocketClient:
                 hl = message[0] if isinstance(message, list) and len(message) == 1 else message
                 if isinstance(hl, dict) and hl.get("index") is not None and (
                         "data" in hl or "candles" in hl or "history" in hl):
-                    store = self.api.history_load_data
+                    store = self.api.__dict__.setdefault("history_load_data", {})
                     store[hl["index"]] = hl
                     while len(store) > 500:
                         store.pop(next(iter(store)))
