@@ -1787,7 +1787,7 @@ class QuotexSession:
                 asset_locks.pop(asset, None)
 
 
-    async def _history_load(
+    async def history_load(
         self, asset: str, period: int, end_time: float, offset: int, timeout: float = 10.0
     ) -> list[dict[str, Any]]:
         """Send a raw ``history/load`` request and return the broker's candles as-is."""
@@ -1899,7 +1899,7 @@ class QuotexSession:
             target = int(count)
 
             # Direct history/load: return every candle Quotex sends, untouched.
-            direct = await self._history_load(
+            direct = await self.history_load(
                 asset, int(period), time.time(), int(period) * target
             )
             if direct:
@@ -3041,7 +3041,7 @@ class QuotexSession:
         client = self.client
         if client is None:
             return None
-        direct = await self._history_load(
+        direct = await self.history_load(
             asset, int(period), bucket_time + int(period) * 2, int(period) * 5
         )
         for c in direct:

@@ -67,6 +67,14 @@ class WebsocketClient:
                         self.api.instruments = message
                 except (ValueError, TypeError):
                     pass
+                # Capture every history/load reply by its request index (parallel-safe)
+                hl = message[0] if isinstance(message, list) and len(message) == 1 else message
+                if isinstance(hl, dict) and hl.get("index") is not None and (
+                        "data" in hl or "candles" in hl or "history" in hl):
+                    store = self.api.history_load_data
+                    store[hl["index"]] = hl
+                    while len(store) > 500:
+                        store.pop(next(iter(store)))
                 if isinstance(message, dict):
                     if message.get("signals"):
                         time_in = message.get("time")
@@ -89,8 +97,6 @@ class WebsocketClient:
                         self.api.profit_today = message
                     elif message.get("index"):
                         self.api.historical_candles = message
-                        # Keep every history/load response keyed by its request index
-                        self.api.history_load_data[message["index"]] = message
                         if message.get("closeTimestamp"):
                             self.api.timesync.server_timestamp = message.get("closeTimestamp")
                     if message.get("pending"):
