@@ -270,6 +270,8 @@ class LiveCollector:
         Returns None when the v2 reply belongs to another timeframe.
         """
         v2 = (api.candle_v2_data.get(code) or {}).get("candles") or []
+        # Quotex sends v2 candles newest-first, so compare on time-sorted rows.
+        v2 = sorted(v2, key=lambda c: float(c.get("time", 0) or 0))
         if v2 and _spacing(v2) not in (0, p):
             return None
         book: dict[int, dict[str, Any]] = {}
@@ -278,8 +280,8 @@ class LiveCollector:
                 book[int(c["time"])] = c
         except Exception:  # noqa: BLE001
             pass
-        # Broker OHLC wins over tick-built buckets.
-        for c in v2[1:]:
+        # Broker OHLC wins over tick-built buckets (running candle is cut later).
+        for c in v2:
             book[(int(c["time"]) // p) * p] = c
         # history/load reply (if the broker sent one) only fills older gaps.
         for c in self._history_load_reply(api, p):
