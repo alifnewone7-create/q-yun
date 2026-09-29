@@ -157,12 +157,18 @@ python main.py
 
 ```bash
 cp /root/python_backend/deploy/quotex-backend.service /etc/systemd/system/
+cp /root/python_backend/deploy/quotex-backend-health.service /etc/systemd/system/
+cp /root/python_backend/deploy/quotex-backend-health.timer /etc/systemd/system/
+chmod +x /root/python_backend/deploy/healthcheck.sh
 systemctl daemon-reload
 systemctl enable --now quotex-backend
+# প্রতি মিনিটে /health চেক — backend আটকে গেলে (৩ বার সাড়া না দিলে) auto restart
+systemctl enable --now quotex-backend-health.timer
 
 # status + live log
 systemctl status quotex-backend
 journalctl -u quotex-backend -f
+journalctl -u quotex-backend-health -n 50 --no-pager
 ```
 
 এই কমান্ডগুলো কাজে লাগবে:

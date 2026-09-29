@@ -4,6 +4,8 @@
 Description=Quotex Live backend (always-on markets)
 After=network-online.target
 Wants=network-online.target
+# Never give up restarting, however many times it crashes.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -12,11 +14,14 @@ WorkingDirectory=/root/python_backend
 # main.py auto-loads python_backend/.env via python-dotenv (no EnvironmentFile
 # needed — systemd would NOT strip inline "# comments" from values).
 ExecStart=/root/python_backend/venv/bin/python main.py
+Environment=PYTHONUNBUFFERED=1
 Restart=always
-RestartSec=5
+# 15s gap so a failing login is not hammered against Quotex.
+RestartSec=15
 # Give the backend time to close the Quotex session cleanly on restart
 TimeoutStopSec=20
 KillSignal=SIGTERM
+KillMode=mixed
 LimitNOFILE=65535
 StandardOutput=journal
 StandardError=journal

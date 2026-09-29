@@ -1,0 +1,8 @@
+# /etc/systemd/system/quotex-backend-health.service
+# One-shot health check, triggered every minute by quotex-backend-health.timer.
+[Unit]
+Description=Quotex Live backend health check
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /root/python_backend/deploy/healthcheck.sh
