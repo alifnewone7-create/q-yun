@@ -22,7 +22,9 @@ Key = tuple[str, int]
 KeyCb = Callable[[Key, Any], Awaitable[None]]
 MAX_CANDLES = 200
 HISTORY_COUNT = 199
-V2_TIMEOUT_S = 8.0
+V2_TIMEOUT_S = 5.0
+HISTORY_LOAD_TIMEOUT_S = 6.0
+HISTORY_LOAD_STEPS = 6
 BACKFILL_ATTEMPTS = 3
 
 
@@ -156,7 +158,6 @@ class LiveCollector:
         # One market at a time on the socket: pyquotex only keeps the
         # history/list/v2 reply of ``api.current_asset``.
         self._ws_lock = asyncio.Lock()
-        self._last_index = 0
 
     # ------------------------------------------------------------ public
     @property
@@ -283,9 +284,6 @@ class LiveCollector:
         # Broker OHLC wins over tick-built buckets (running candle is cut later).
         for c in v2:
             book[(int(c["time"]) // p) * p] = c
-        # history/load reply (if the broker sent one) only fills older gaps.
-        for c in self._history_load_reply(api, p):
-            book.setdefault(int(c["time"]), c)
         out = []
         for t in sorted(book):
             c = book[t]
@@ -297,20 +295,46 @@ class LiveCollector:
                         "close": cl, "volume": 0.0})
         return out
 
-    def _history_load_reply(self, api: Any, p: int) -> list[dict[str, Any]]:
-        store = getattr(api, "history_load_data", None) or {}
-        msg = store.pop(self._last_index, None)
-        rows = (msg or {}).get("data") or (msg or {}).get("candles") or []
-        out = []
-        for r in rows if isinstance(rows, list) else []:
-            if isinstance(r, (list, tuple)) and len(r) >= 5:
-                r = {"time": r[0], "open": r[1], "close": r[2], "high": r[3], "low": r[4]}
-            if isinstance(r, dict) and r.get("open") is not None:
-                out.append(dict(r, time=(int(float(r["time"])) // p) * p))
-        return out
+    async def _history_load_walk(self, code: str, p: int, cut: int) -> dict[int, dict[str, Any]]:
+        """pyquotex get_historical_candles style: history/load by index, walking back until 199."""
+        book: dict[int, dict[str, Any]] = {}
+        end = cut
+        for _ in range(HISTORY_LOAD_STEPS):
+            rows = await self.session.history_load(
+                code, p, end, HISTORY_COUNT * p, timeout=HISTORY_LOAD_TIMEOUT_S
+            )
+            new = [c for c in rows if c["time"] < cut and c["time"] not in book]
+            if not new:
+                break
+            for c in new:
+                book[int(c["time"])] = dict(c, volume=0.0)
+            if len(book) >= HISTORY_COUNT:
+                break
+            end = min(int(c["time"]) for c in new)
+        return book
+
+    async def _v2_fetch(self, client: Any, api: Any, code: str, p: int) -> list[dict[str, Any]]:
+        """Re-subscribe the asset so Quotex sends a fresh history/list/v2 (199 candles)."""
+        async with self._ws_lock:
+            api.candles.candles_data = None
+            api.candle_v2_data.pop(code, None)
+            # Quotex only sends v2 on a fresh subscribe, not for an already-followed asset.
+            await _maybe_await(client.stop_candles_stream(code))
+            await asyncio.sleep(0.2)
+            await _maybe_await(client.start_candles_stream(code, p))
+            deadline = time.time() + V2_TIMEOUT_S
+            while time.time() < deadline:
+                ticks = api.candles.candles_data
+                if ticks is not None:
+                    got = self._v2_candles(api, code, p, ticks)
+                    if got is not None:
+                        return got
+                    api.candles.candles_data = None  # late reply for another timeframe
+                await asyncio.sleep(0.1)
+        return []
 
     async def _backfill_one(self, key: Key) -> bool:
-        """crt-chk formation: subscribe this asset, send history/load, read its history/list/v2."""
+        """history/load walk-back first; history/list/v2 fills the rest."""
         code, p = key
         client = self._client
         api = getattr(client, "api", None)
@@ -318,37 +342,33 @@ class LiveCollector:
             return True
         if api is None:
             return False
-        hist: list[dict[str, Any]] = []
-        async with self._ws_lock:
-            try:
-                api.candles.candles_data = None
-                await _maybe_await(client.start_candles_stream(code, p))
-                self._last_index = max(int(time.time() * 100), self._last_index + 1)
-                end = int(self.started_at or time.time())
-                await _maybe_await(api.get_candles(code, self._last_index, end, HISTORY_COUNT * p + p, p))
-                deadline = time.time() + V2_TIMEOUT_S
-                while time.time() < deadline:
-                    ticks = api.candles.candles_data
-                    if ticks is not None:
-                        got = self._v2_candles(api, code, p, ticks)
-                        if got is not None:
-                            hist = got
-                            break
-                        api.candles.candles_data = None  # late reply for another timeframe
-                    await asyncio.sleep(0.1)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("backfill %s/%s failed: %r", code, p, exc)
-        if not hist:
-            log.warning("backfill %s/%ss: no history/list/v2 reply in %.0fs", code, p, V2_TIMEOUT_S)
         live = self.store.get(key)
         cut = int(self.started_at or time.time())
         if live:
             cut = min(cut, int(live[0]["time"]))
-        older = [c for c in hist if c["time"] < cut][-HISTORY_COUNT:]
+        book: dict[int, dict[str, Any]] = {}
+        sources = []
+        try:
+            book = await self._history_load_walk(code, p, cut)
+            if book:
+                sources.append(f"history/load={len(book)}")
+            if len(book) < HISTORY_COUNT:
+                v2 = await self._v2_fetch(client, api, code, p)
+                added = 0
+                for c in v2:
+                    if c["time"] < cut and c["time"] not in book:
+                        book[c["time"]] = c
+                        added += 1
+                if v2:
+                    sources.append(f"v2=+{added}")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("backfill %s/%s failed: %r", code, p, exc)
+        older = [book[t] for t in sorted(book)][-HISTORY_COUNT:]
         if not older:
+            log.warning("backfill %s/%ss: no history from history/load or v2", code, p)
             return False
         self._backfilled.add(key)
-        log.info("history %s/%ss: %d candles (history/list/v2)", code, p, len(older))
+        log.info("history %s/%ss: %d candles (%s)", code, p, len(older), ", ".join(sources))
         self.store.set_history(key, (older + live)[-MAX_CANDLES * 2:], p)
         await self.on_history(key, self.store.get(key))
         return True
