@@ -10,10 +10,11 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-import os
 import re
 import time
 from typing import Any, Awaitable, Callable
+
+from pyquotex.utils.processor import calculate_candles
 
 log = logging.getLogger("live-collector")
 
@@ -21,9 +22,17 @@ Key = tuple[str, int]
 KeyCb = Callable[[Key, Any], Awaitable[None]]
 MAX_CANDLES = 200
 HISTORY_COUNT = 199
-HISTORY_TIMEOUT_S = 15.0
-BACKFILL_CONCURRENCY = int(os.getenv("LIVE_BACKFILL_CONCURRENCY", "10"))
+V2_TIMEOUT_S = 8.0
 BACKFILL_ATTEMPTS = 3
+
+
+def _spacing(candles: list[dict[str, Any]]) -> int:
+    """Most common gap between consecutive candle times (0 if unknown)."""
+    gaps: dict[int, int] = {}
+    for a, b in zip(candles, candles[1:]):
+        g = int(b["time"]) - int(a["time"])
+        gaps[g] = gaps.get(g, 0) + 1
+    return max(gaps, key=gaps.get) if gaps else 0
 
 
 async def _maybe_await(res: Any) -> Any:
@@ -144,6 +153,10 @@ class LiveCollector:
         self._forming: dict[Key, dict[str, Any]] = {}
         self._backfilled: set[Key] = set()
         self._backfill_task: asyncio.Task | None = None
+        # One market at a time on the socket: pyquotex only keeps the
+        # history/list/v2 reply of ``api.current_asset``.
+        self._ws_lock = asyncio.Lock()
+        self._last_index = 0
 
     # ------------------------------------------------------------ public
     @property
@@ -178,12 +191,13 @@ class LiveCollector:
 
     async def _subscribe(self, codes: list[str]) -> None:
         client = self._client
-        for code in codes:
-            try:
-                await _maybe_await(client.start_candles_stream(code, 60))
-            except Exception as exc:  # noqa: BLE001
-                log.debug("subscribe %s failed: %s", code, exc)
-            await asyncio.sleep(0.04)
+        async with self._ws_lock:
+            for code in codes:
+                try:
+                    await _maybe_await(client.start_candles_stream(code, 60))
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("subscribe %s failed: %s", code, exc)
+                await asyncio.sleep(0.04)
 
     def _next_boundary(self) -> float:
         now = time.time()
@@ -250,20 +264,80 @@ class LiveCollector:
             self.store.push(key, candle, key[1])
             await self.on_candle(key, candle)
 
-    async def _backfill_one(self, key: Key, sem: asyncio.Semaphore) -> bool:
-        """history/load for one stream; requests are matched by index so they can overlap."""
-        code, p = key
-        async with sem:
-            if code not in self.markets:
-                return True
-            end = int(self.started_at or time.time())
+    def _v2_candles(self, api: Any, code: str, p: int, ticks: Any) -> list[dict[str, Any]] | None:
+        """pyquotex prepare_candles (crt-chk): tick-built candles + broker v2 candles.
+
+        Returns None when the v2 reply belongs to another timeframe.
+        """
+        v2 = (api.candle_v2_data.get(code) or {}).get("candles") or []
+        if v2 and _spacing(v2) not in (0, p):
+            return None
+        book: dict[int, dict[str, Any]] = {}
+        try:
+            for c in calculate_candles(ticks, p):
+                book[int(c["time"])] = c
+        except Exception:  # noqa: BLE001
+            pass
+        # Broker OHLC wins over tick-built buckets.
+        for c in v2[1:]:
+            book[(int(c["time"]) // p) * p] = c
+        # history/load reply (if the broker sent one) only fills older gaps.
+        for c in self._history_load_reply(api, p):
+            book.setdefault(int(c["time"]), c)
+        out = []
+        for t in sorted(book):
+            c = book[t]
             try:
-                hist = await self.session.history_load(
-                    code, p, end, HISTORY_COUNT * p + p, timeout=HISTORY_TIMEOUT_S
-                )
+                o, h, lo, cl = (float(c[k]) for k in ("open", "high", "low", "close"))
+            except (KeyError, TypeError, ValueError):
+                continue
+            out.append({"time": t, "open": o, "high": max(h, o, cl), "low": min(lo, o, cl),
+                        "close": cl, "volume": 0.0})
+        return out
+
+    def _history_load_reply(self, api: Any, p: int) -> list[dict[str, Any]]:
+        store = getattr(api, "history_load_data", None) or {}
+        msg = store.pop(self._last_index, None)
+        rows = (msg or {}).get("data") or (msg or {}).get("candles") or []
+        out = []
+        for r in rows if isinstance(rows, list) else []:
+            if isinstance(r, (list, tuple)) and len(r) >= 5:
+                r = {"time": r[0], "open": r[1], "close": r[2], "high": r[3], "low": r[4]}
+            if isinstance(r, dict) and r.get("open") is not None:
+                out.append(dict(r, time=(int(float(r["time"])) // p) * p))
+        return out
+
+    async def _backfill_one(self, key: Key) -> bool:
+        """crt-chk formation: subscribe this asset, send history/load, read its history/list/v2."""
+        code, p = key
+        client = self._client
+        api = getattr(client, "api", None)
+        if code not in self.markets:
+            return True
+        if api is None:
+            return False
+        hist: list[dict[str, Any]] = []
+        async with self._ws_lock:
+            try:
+                api.candles.candles_data = None
+                await _maybe_await(client.start_candles_stream(code, p))
+                self._last_index = max(int(time.time() * 100), self._last_index + 1)
+                end = int(self.started_at or time.time())
+                await _maybe_await(api.get_candles(code, self._last_index, end, HISTORY_COUNT * p + p, p))
+                deadline = time.time() + V2_TIMEOUT_S
+                while time.time() < deadline:
+                    ticks = api.candles.candles_data
+                    if ticks is not None:
+                        got = self._v2_candles(api, code, p, ticks)
+                        if got is not None:
+                            hist = got
+                            break
+                        api.candles.candles_data = None  # late reply for another timeframe
+                    await asyncio.sleep(0.1)
             except Exception as exc:  # noqa: BLE001
                 log.warning("backfill %s/%s failed: %r", code, p, exc)
-                hist = []
+        if not hist:
+            log.warning("backfill %s/%ss: no history/list/v2 reply in %.0fs", code, p, V2_TIMEOUT_S)
         live = self.store.get(key)
         cut = int(self.started_at or time.time())
         if live:
@@ -272,16 +346,15 @@ class LiveCollector:
         if not older:
             return False
         self._backfilled.add(key)
-        log.info("history %s/%ss: %d candles (history/load)", code, p, len(older))
+        log.info("history %s/%ss: %d candles (history/list/v2)", code, p, len(older))
         self.store.set_history(key, (older + live)[-MAX_CANDLES * 2:], p)
         await self.on_history(key, self.store.get(key))
         return True
 
     async def _backfill(self) -> None:
-        """Fetch every stream's history together (bounded concurrency), retrying failures."""
+        """Walk every market one by one (crt-chk style), retrying failures."""
         while self.started_at is not None and time.time() < self.started_at:
             await asyncio.sleep(0.5)
-        sem = asyncio.Semaphore(BACKFILL_CONCURRENCY)
         for attempt in range(1, BACKFILL_ATTEMPTS + 1):
             pending = [
                 (code, p) for code in list(self.markets) for p in self.periods
@@ -289,14 +362,19 @@ class LiveCollector:
             ]
             if not pending:
                 break
-            results = await asyncio.gather(*(self._backfill_one(k, sem) for k in pending))
-            failed = [k for k, ok in zip(pending, results) if not ok]
+            failed = []
+            for k in pending:
+                if not await self._backfill_one(k):
+                    failed.append(k)
+                await self._emit(self._drain(discard=False))
             log.info(
                 "backfill round %d: %d/%d ok, %d failed",
                 attempt, len(pending) - len(failed), len(pending), len(failed),
             )
             if failed:
                 await asyncio.sleep(2)
+        # Put every market back on the 60s stream after the per-period requests.
+        await self._subscribe(list(self.markets))
         total = len(self.markets) * len(self.periods)
         log.info("backfill finished: %d/%d streams have history", len(self._backfilled), total)
 
