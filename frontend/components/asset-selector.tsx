@@ -206,7 +206,7 @@ export function AssetSelector({ assets, current, onSelect, loading, icon: Icon =
             />
           </div>
           {tabs.length > 0 && (
-            <div className="mt-1.5 flex gap-1 overflow-x-auto sm:mt-2" role="tablist" data-testid="market-category-tabs">
+            <div className="mt-1.5 flex gap-1 overflow-x-auto pb-2 [scrollbar-width:thin] sm:mt-2" role="tablist" data-testid="market-category-tabs">
               {tabs.map((t) => {
                 const selected = t.id === activeTab && !query
                 const count = allowedAssets.filter((r) => r.category === t.id).length
