@@ -44,6 +44,8 @@ export function AssetSelector({ assets, current, onSelect, loading, icon: Icon =
   const [query, setQuery] = useState("")
   const [open, setOpen] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
+  const tabsRef = useRef<HTMLDivElement>(null)
+  const touchX = useRef<number | null>(null)
 
   // Auto-focus search input when dropdown opens
   useEffect(() => {
@@ -206,7 +208,22 @@ export function AssetSelector({ assets, current, onSelect, loading, icon: Icon =
             />
           </div>
           {tabs.length > 0 && (
-            <div className="mt-1.5 flex gap-1 overflow-x-auto pb-2 [scrollbar-width:thin] sm:mt-2" role="tablist" data-testid="market-category-tabs">
+            <div
+              ref={tabsRef}
+              className="mt-1.5 flex touch-none gap-1 overflow-x-auto pb-2 [scrollbar-width:thin] sm:mt-2"
+              role="tablist"
+              data-testid="market-category-tabs"
+              // Menu scroll-lock blocks native touch scroll, so swipe is handled manually.
+              onTouchStart={(e) => { touchX.current = e.touches[0].clientX }}
+              onTouchMove={(e) => {
+                const el = tabsRef.current
+                if (!el || touchX.current === null) return
+                const x = e.touches[0].clientX
+                el.scrollLeft += touchX.current - x
+                touchX.current = x
+              }}
+              onTouchEnd={() => { touchX.current = null }}
+            >
               {tabs.map((t) => {
                 const selected = t.id === activeTab && !query
                 const count = allowedAssets.filter((r) => r.category === t.id).length
